@@ -365,7 +365,7 @@ async def main():
             checkout_date="2026-11-12",
             guests=2,
             rooms=1,
-            lead_guest_name="Dinesh Polamarasetty",
+            lead_guest_name="Dinesh",
             lead_guest_email="dinesh@example.com"
         )
         

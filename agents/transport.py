@@ -261,6 +261,7 @@
  #       self.browser.close()
 #
 import os
+from dotenv import load_dotenv
 import time
 from typing import Dict, Any, List, Optional
 from selenium import webdriver
@@ -274,10 +275,17 @@ from selenium_stealth import stealth
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_classic.agents import create_openai_tools_agent
+from langchain_classic.agents import AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 
+print("Checking env files")
+if load_dotenv():
+    print("ENV files loaded")
+else :
+    print("ENV issue")
+    exit(1)
 # ---------------------------------------------------------------------------
 # 1. STATION CODE RESOLVER MAPPING
 # ---------------------------------------------------------------------------
