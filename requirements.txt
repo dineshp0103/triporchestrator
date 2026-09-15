@@ -1,0 +1,12 @@
+geopy>=2.5.0
+langchain>=0.3.0
+langchain-classic>=1.0.8
+langchain-core>=1.0.0
+langchain-groq>=0.3.0
+langchain-openai>=1.6.2
+playwright>=1.63.0
+python-dotenv>=1.2.2
+requests>=2.32.0
+selenium>=4.49.0
+selenium-stealth>=1.0.6
+webdriver-manager>=4.1.2
