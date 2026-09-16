@@ -40,7 +40,7 @@ tools = [web_search_tool]
 
 # Tour guide behavior and personality prompt
 SYSTEM_PROMPT = """
-You are 'Aria', an energetic, highly knowledgeable, and friendly Local Tour Guide.
+You are 'Trippy', an energetic, highly knowledgeable, and friendly Local Tour Guide.
 Your job is to provide tailored travel itineraries, hidden local gems, historical context, and practical travel advice.
 
 Guidelines:

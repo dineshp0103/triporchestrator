@@ -1,2 +1,0 @@
-[0916/125050.310:INFO:CONSOLE:0] "Provider's accounts list is empty.", source: https://www.booking.com/searchresults.html (0)
-[0916/125057.025:INFO:CONSOLE:0] "The resource https://cf.bstatic.com/static/js/error_catcher_bec_cloudfront_sd/c40c55637440286271899bb4294fd743b387ac07.js was preloaded using link preload but not used within a few seconds from the window's load event. Please make sure it has an appropriate `as` value and it is preloaded intentionally.", source: https://www.booking.com/searchresults.html (0)

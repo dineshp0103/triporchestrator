@@ -46,6 +46,7 @@ try:
     from agents.orchestra import build_orchestrator_graph, HumanMessage, booking_module, transport_module
     from agents.weather_agent import weather_agent
     from agents.guide import tour_guide_agent
+    from agents.llm_convo import needs_orchestration, stream_normal_convo
     ORCHESTRATOR_AVAILABLE = True
 except Exception as exc:
     ORCHESTRATOR_AVAILABLE = False
@@ -129,7 +130,7 @@ if "messages" not in st.session_state:
                 "👋 Hello! I am your **Master Travel Orchestrator**.\n\n"
                 "I coordinate a team of AI agents to plan your entire trip:\n"
                 "- 🌦️ **Weather** – Live forecasts for any destination\n"
-                "- 🗺️ **Tour Guide (Aria)** – Itineraries & local attractions\n"
+                "- 🗺️ **Tour Guide (Trippy)** – Itineraries & local attractions\n"
                 "- 🏨 **Booking** – Hotel search on Booking.com\n"
                 "- 🚆 **Transport** – IRCTC train availability\n\n"
                 "Tell me about your trip and I'll get started! "
@@ -162,7 +163,7 @@ with st.sidebar:
     pages = {
         "chat":      "💬 Chat (Orchestrator)",
         "weather":   "🌦️ Weather Agent",
-        "guide":     "🗺️ Tour Guide (Aria)",
+        "guide":     "🗺️ Tour Guide (Trippy)",
         "booking":   "🏨 Booking Agent",
         "transport": "🚆 Transport Agent",
     }
@@ -170,15 +171,6 @@ with st.sidebar:
         if st.button(label, key=f"nav_{key}", use_container_width=True):
             st.session_state.active_page = key
             st.rerun()
-
-    st.markdown("---")
-    st.subheader("📋 Trip Tracker")
-    info = st.session_state.trip_info
-    st.markdown(f"- **Destination**: {info['destination'] or '❓ Not set'}")
-    st.markdown(f"- **Origin**: {info['origin'] or '❓ Not set'}")
-    st.markdown(f"- **Check-in**: {info['checkin_date'] or '❓ Not set'}")
-    st.markdown(f"- **Check-out**: {info['checkout_date'] or '❓ Not set'}")
-    st.markdown(f"- **Guests**: {info['guests'] or '❓ Not set'}")
 
     st.markdown("---")
     st.subheader("🤖 Agent Suite")
@@ -213,7 +205,7 @@ page = st.session_state.active_page
 titles = {
     "chat":      ("✈️ Master Travel Orchestrator", "Chat with your AI agent team"),
     "weather":   ("🌦️ Weather Agent", "Live weather forecasts for any destination"),
-    "guide":     ("🗺️ Tour Guide – Aria", "Personalised itineraries & local tips"),
+    "guide":     ("🗺️ Tour Guide – Trippy", "Personalised itineraries & local tips"),
     "booking":   ("🏨 Accommodation Agent", "Real-time hotel search on Booking.com"),
     "transport": ("🚆 Transport Agent", "IRCTC train seat availability"),
 }
@@ -293,17 +285,39 @@ if page == "chat":
             if g in pl:
                 st.session_state.trip_info["guests"] = g.split()[0]
 
-        # 3. Run orchestrator (on a thread – never call st.* inside the coro)
+        # 3. Handle prompt via Normal LLM Convo vs Multi-Agent Orchestrator
         if not ORCHESTRATOR_AVAILABLE:
             with st.chat_message("assistant", avatar="🤖"):
                 st.error(f"Agents unavailable – import failed:\n```\n{IMPORT_ERROR}\n```")
+        elif not needs_orchestration(prompt):
+            # Normal conversation prompt (e.g. "Hi", "Hello, What can you do", chit-chat)
+            with st.chat_message("assistant", avatar="🤖"):
+                # Snapshot history excluding the latest user message just added
+                history_snapshot = st.session_state.messages[:-1]
+                reply_stream = stream_normal_convo(history_snapshot, prompt)
+                full_reply = st.write_stream(reply_stream)
+                st.session_state.messages.append({"role": "assistant", "content": full_reply})
         else:
-            # Snapshot needed data before the thread
+            # Travel planning query -> Run Multi-Agent Orchestrator
             msgs_snapshot = [
                 m["content"]
                 for m in st.session_state.messages
                 if m["role"] == "user"
             ]
+
+            AGENT_CONNECT_LOGS = {
+                "Weather": "Connected with weather agent for weather report",
+                "TourGuide": "Connected with tour guide agent for itinerary recommendations",
+                "Booking": "Connected with booking agent for hotel search",
+                "Transport": "Connected with transport agent to see the transport availability",
+            }
+
+            AGENT_COMPLETE_LOGS = {
+                "Weather": "Weather report Generated",
+                "TourGuide": "Tour guide itinerary Generated",
+                "Booking": "Hotel booking options Generated",
+                "Transport": "Transport Availability Report Generated",
+            }
 
             with st.chat_message("assistant", avatar="🤖"):
                 status = st.status("🤖 Orchestrating agents…", expanded=True)
@@ -311,29 +325,30 @@ if page == "chat":
                 async def _run(user_msgs: list) -> dict:
                     """Runs entirely in a worker thread – NO st.* calls allowed here."""
                     graph = build_orchestrator_graph()
-                    hm    = [HumanMessage(content=c) for c in user_msgs]
-                    steps, responses = [], []
+                    hm = [HumanMessage(content=c) for c in user_msgs]
+                    status_logs, responses = [], []
                     async for chunk in graph.astream({"messages": hm}):
                         for node, update in chunk.items():
                             if node == "Supervisor":
-                                steps.append(update.get("next", "FINISH"))
-                            elif "messages" in update:
+                                next_node = update.get("next")
+                                if next_node in AGENT_CONNECT_LOGS:
+                                    status_logs.append(AGENT_CONNECT_LOGS[next_node])
+                            elif node in AGENT_COMPLETE_LOGS and "messages" in update:
+                                status_logs.append(AGENT_COMPLETE_LOGS[node])
                                 responses.append({
-                                    "agent":   node,
+                                    "agent": node,
                                     "content": update["messages"][-1].content,
                                 })
-                    return {"steps": steps, "responses": responses}
+                    return {"status_logs": status_logs, "responses": responses}
 
                 try:
                     result = run_async_coro(_run(msgs_snapshot))
 
-                    # Render on main thread
-                    for s in result["steps"]:
-                        status.write(f"🔄 Supervisor → `{s}`")
-                    for r in result["responses"]:
-                        status.write(f"✅ {r['agent']} agent done")
+                    # Render connection and completion status logs on main thread
+                    for log in result["status_logs"]:
+                        status.write(log)
 
-                    status.update(label="🎉 Complete!", state="complete", expanded=False)
+                    status.update(label="🎉 Orchestration Complete!", state="complete", expanded=False)
 
                     if result["responses"]:
                         parts = [
@@ -389,14 +404,14 @@ elif page == "guide":
     import queue, threading
 
     query = st.text_area(
-        "Ask Aria:",
+        "Ask Trippy:",
         value="I am visiting Kyoto for 2 days. What are the top 3 places to visit?",
         height=90,
         key="g_text",
     )
     if st.button("Ask Tour Guide 🗺️", type="primary"):
-        st.markdown("### 🎒 Aria's Recommendations")
-        st.caption("_Streaming live – words appear as Aria generates them…_")
+        st.markdown("### 🎒 Trippy's Recommendations")
+        st.caption("_Streaming live – words appear as Trippy generates them…_")
 
         # ------------------------------------------------------------------
         # Bridge: async astream_events → sync queue → st.write_stream

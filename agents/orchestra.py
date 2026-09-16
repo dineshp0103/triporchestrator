@@ -1,8 +1,8 @@
 import os
 import asyncio
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, Optional, TypedDict
 from pydantic import BaseModel
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_classic.agents import tool
@@ -41,6 +41,7 @@ print("LLM was acessed...")
 class OrchestratorState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     next: str
+    direct_reply: Optional[str]
 
 # ---------------------------------------------------------------------------
 # 3. Initialize Instantiated Sub-Agents
@@ -94,33 +95,79 @@ def transport_node(state: OrchestratorState):
 # ---------------------------------------------------------------------------
 class RouteResponse(BaseModel):
     next: Literal["Weather", "TourGuide", "Booking", "Transport", "FINISH"]
+    direct_reply: Optional[str] = None  # filled when next==FINISH for non-travel queries
 
 SUPERVISOR_SYSTEM_PROMPT = """
-You are the Master Travel Orchestrator managing a team of specialized sub-agents.
-Your goal is to inspect the conversation and decide which sub-agent should act next to fulfill the user's travel request.
+You are the Master Travel Orchestrator — an AI assistant managing a team of specialized travel sub-agents.
 
 Sub-Agents & Responsibilities:
-- Weather: Real-time weather forecasts and climate checks for destination cities.
-- TourGuide: Itineraries, sightseeing recommendations, local attractions, and travel advice.
-- Booking: Hotel, accommodation, and stay reservations.
-- Transport: Train and inter-city transport searches and bookings.
-- FINISH: Respond with FINISH when all parts of the user request have been addressed.
+- Weather   : Real-time weather forecasts and climate checks for destination cities.
+- TourGuide : Itineraries, sightseeing recommendations, local attractions, travel advice.
+- Booking   : Hotel, accommodation, and stay reservations via Booking.com.
+- Transport : Train and inter-city transport searches via IRCTC.
+- FINISH    : Use when all user requests have been fulfilled OR when the query is casual /
+              conversational (greetings, introductions, thanks, general questions not related
+              to travel planning).  In that case populate `direct_reply` with a friendly
+              response and set next = FINISH.
+
+Rules:
+1. For greetings or non-travel questions, set next=FINISH and write a helpful reply in direct_reply.
+2. For travel queries, route to the appropriate agent and leave direct_reply empty.
+3. Once all parts of a travel request are fulfilled, set next=FINISH.
 """
 
+# Keywords that signal a travel-planning intent
+_TRAVEL_KEYWORDS = [
+    "weather", "forecast", "temperature", "climate",
+    "hotel", "booking", "accommodation", "room", "stay",
+    "train", "transport", "irctc", "ticket", "seat",
+    "itinerary", "places", "visit", "trip", "tour", "travel",
+    "plan", "flight", "guide", "tourist", "sightseeing",
+]
+
+def _is_travel_query(text: str) -> bool:
+    """Quick heuristic — returns True if the message looks like a travel request."""
+    lower = text.lower()
+    return any(kw in lower for kw in _TRAVEL_KEYWORDS)
+
+
 def supervisor_node(state: OrchestratorState):
+    last_user_msg = next(
+        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+        ""
+    )
+
+    # Fast-path for non-travel queries: generate dynamic LLM response without hardcoded strings
+    if not _is_travel_query(last_user_msg):
+        messages = [
+            SystemMessage(content="You are the Master Travel Orchestrator. Respond warmly and helpfully to general questions or greetings, explaining how your team (Weather, Tour Guide, Booking, Transport) can help plan trips when ready.")
+        ] + state["messages"]
+        reply_msg = ORCHESTRATOR_LLM.invoke(messages)
+        return {"next": "FINISH", "direct_reply": reply_msg.content}
+
+    # Travel query → ask LLM to route to the right sub-agent
     messages = [SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT)] + state["messages"]
     structured_llm = ORCHESTRATOR_LLM.with_structured_output(RouteResponse)
     response = structured_llm.invoke(messages)
-    return {"next": response.next}
+    return {"next": response.next, "direct_reply": response.direct_reply or None}
 
 # ---------------------------------------------------------------------------
 # 6. Build and Compile the StateGraph
 # ---------------------------------------------------------------------------
+def finish_node(state: OrchestratorState):
+    """Surfaces a direct_reply (e.g. greeting response) as an AI message."""
+    reply = state.get("direct_reply")
+    if reply:
+        return {"messages": [AIMessage(content=reply)]}
+    return {}
+
+
 def build_orchestrator_graph():
     workflow = StateGraph(OrchestratorState)
 
-    # Add Supervisor and Sub-Agent Nodes
+    # Add Supervisor, FINISH, and Sub-Agent Nodes
     workflow.add_node("Supervisor", supervisor_node)
+    workflow.add_node("Finish", finish_node)
     workflow.add_node("Weather", weather_node)
     workflow.add_node("TourGuide", tour_guide_node)
     workflow.add_node("Booking", booking_node)
@@ -133,13 +180,15 @@ def build_orchestrator_graph():
         "Supervisor",
         lambda state: state["next"],
         {
-            "Weather": "Weather",
+            "Weather":   "Weather",
             "TourGuide": "TourGuide",
-            "Booking": "Booking",
+            "Booking":   "Booking",
             "Transport": "Transport",
-            "FINISH": END,
+            "FINISH":    "Finish",   # goes through Finish node → then END
         },
     )
+
+    workflow.add_edge("Finish", END)
 
     # Route sub-agents back to Supervisor for step-by-step re-evaluations
     for node_name in ["Weather", "TourGuide", "Booking", "Transport"]:
