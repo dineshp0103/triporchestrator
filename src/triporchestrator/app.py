@@ -40,17 +40,43 @@ def run_async_coro(coro):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         return ex.submit(_worker).result()
 
-# ── Agent imports ─────────────────────────────────────────────────────────────
-IMPORT_ERROR = None
-try:
-    from agents.orchestra import build_orchestrator_graph, HumanMessage, booking_module, transport_module
-    from agents.weather_agent import weather_agent
-    from agents.guide import tour_guide_agent
-    from agents.llm_convo import needs_orchestration, stream_normal_convo
-    ORCHESTRATOR_AVAILABLE = True
-except Exception as exc:
-    ORCHESTRATOR_AVAILABLE = False
-    IMPORT_ERROR = str(exc)
+# ── Cached Agent Imports ──────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def load_agent_suite():
+    """Cache heavy agent imports and LLM workflow graphs in memory to eliminate rerun latency."""
+    try:
+        from agents.orchestra import build_orchestrator_graph, HumanMessage, booking_module, transport_module
+        from agents.weather_agent import weather_agent
+        from agents.guide import tour_guide_agent
+        from agents.llm_convo import needs_orchestration, stream_normal_convo
+        return {
+            "available": True,
+            "error": None,
+            "build_orchestrator_graph": build_orchestrator_graph,
+            "HumanMessage": HumanMessage,
+            "booking_module": booking_module,
+            "transport_module": transport_module,
+            "weather_agent": weather_agent,
+            "tour_guide_agent": tour_guide_agent,
+            "needs_orchestration": needs_orchestration,
+            "stream_normal_convo": stream_normal_convo,
+        }
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+suite = load_agent_suite()
+ORCHESTRATOR_AVAILABLE = suite["available"]
+IMPORT_ERROR = suite["error"]
+
+if ORCHESTRATOR_AVAILABLE:
+    build_orchestrator_graph = suite["build_orchestrator_graph"]
+    HumanMessage = suite["HumanMessage"]
+    booking_module = suite["booking_module"]
+    transport_module = suite["transport_module"]
+    weather_agent = suite["weather_agent"]
+    tour_guide_agent = suite["tour_guide_agent"]
+    needs_orchestration = suite["needs_orchestration"]
+    stream_normal_convo = suite["stream_normal_convo"]
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -60,7 +86,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# ── CSS & Animations ──────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
@@ -71,6 +97,62 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     padding-top: 1rem;
     padding-bottom: 1rem;
     max-width: 1100px;
+}
+
+/* Animations */
+@keyframes glowPulse {
+    0% { box-shadow: 0 0 4px rgba(56, 189, 248, 0.2); border-color: rgba(56, 189, 248, 0.3); }
+    50% { box-shadow: 0 0 16px rgba(56, 189, 248, 0.6); border-color: rgba(56, 189, 248, 0.8); }
+    100% { box-shadow: 0 0 4px rgba(56, 189, 248, 0.2); border-color: rgba(56, 189, 248, 0.3); }
+}
+
+@keyframes rotateRing {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+@keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.agent-loading-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(30, 41, 59, 0.8);
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    color: #38BDF8;
+    padding: 0.45rem 0.85rem;
+    border-radius: 8px;
+    font-size: 0.88rem;
+    font-weight: 500;
+    margin-bottom: 0.4rem;
+    animation: glowPulse 2s infinite ease-in-out, fadeInUp 0.3s ease-out;
+}
+
+.agent-done-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    color: #4ADE80;
+    padding: 0.45rem 0.85rem;
+    border-radius: 8px;
+    font-size: 0.88rem;
+    font-weight: 500;
+    margin-bottom: 0.4rem;
+    animation: fadeInUp 0.3s ease-out;
+}
+
+.spinner-ring {
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(56, 189, 248, 0.3);
+    border-top-color: #38BDF8;
+    border-radius: 50%;
+    animation: rotateRing 0.7s linear infinite;
 }
 
 /* Hero header */
