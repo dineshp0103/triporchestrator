@@ -7,7 +7,11 @@ from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate
 from geopy.geocoders import Nominatim
 
-load_dotenv()
+env_file_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_file_path):
+    load_dotenv(env_file_path)
+else:
+    load_dotenv()
 
 def get_city_coordinates(place_name: str):
     """Geocodes a place name to (latitude, longitude) using GeoPy directly."""

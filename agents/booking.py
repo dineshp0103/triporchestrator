@@ -1,13 +1,37 @@
+import sys
 import os
 import asyncio
 from typing import Dict, Any, List, Optional
 from playwright.async_api import async_playwright, Page, BrowserContext
-
-from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
 from langchain_core.tools import tool
-from langchain.agents import AgentExecutor, create_openai_tools_agent
+try:
+    from langchain_classic.agents import AgentExecutor, create_openai_tools_agent
+except ImportError:
+    from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
+# Ensure UTF-8 output encoding for Windows console (handles unicode symbols like ₹, €, etc.)
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+print("Modules imported successfully...")
+print("Checking env access...")
+
+# Load environment variables from agents/.env or project root .env
+env_file_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_file_path):
+    load_dotenv(env_file_path)
+else:
+    load_dotenv()
+
+api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if api_key:
+    print("API keys are accessed")
+else:
+    print("Warning: No API key found in environment variables.")
 
 # ---------------------------------------------------------------------------
 # 1. ON-SCREEN PROMPT HANDLER (HUMAN-IN-THE-LOOP)
@@ -95,11 +119,11 @@ class PlaywrightAccommodationEngine:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=os.path.abspath(self.user_data_dir),
                 headless=False,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 args=[
                     "--start-maximized",
                     "--disable-blink-features=AutomationControlled"
-                ],
-                viewport={"width": 1280, "height": 800}
+                ]
             )
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
@@ -143,7 +167,7 @@ class PlaywrightAccommodationEngine:
         guests: int = 1,
         rooms: int = 1
     ) -> List[Dict[str, Any]]:
-        """Executes deep-link search query for real-time inventory on Booking.com."""
+        """Executes search query for real-time inventory on Booking.com."""
         await self.initialize()
 
         # Direct search URL construction for accurate real-time queries
@@ -152,16 +176,21 @@ class PlaywrightAccommodationEngine:
             f"&checkin={checkin_date}&checkout={checkout_date}"
             f"&group_adults={guests}&no_rooms={rooms}"
         )
-        await self.page.goto(search_url, wait_until="networkidle")
+        await self.page.goto(search_url, wait_until="domcontentloaded")
 
         try:
-            await self.page.wait_for_selector("div[data-testid='property-card']", timeout=10000)
-            cards = await self.page.query_selector_all("div[data-testid='property-card']")
+            await self.page.wait_for_selector(
+                "div[data-testid='property-card'], div[data-testid='property-card-container']", 
+                timeout=15000
+            )
+            cards = await self.page.query_selector_all(
+                "div[data-testid='property-card'], div[data-testid='property-card-container']"
+            )
 
             results = []
             for idx, card in enumerate(cards[:5], start=1):
-                name_el = await card.query_selector("div[data-testid='title']")
-                price_el = await card.query_selector("span[data-testid='price-and-discounted-price']")
+                name_el = await card.query_selector("div[data-testid='title'], [data-testid='header-title']")
+                price_el = await card.query_selector("span[data-testid='price-and-discounted-price'], [data-testid='price-and-discounted-price']")
                 rating_el = await card.query_selector("div[data-testid='review-score']")
 
                 name = await name_el.inner_text() if name_el else f"Property {idx}"
@@ -186,50 +215,90 @@ class PlaywrightAccommodationEngine:
         lead_guest_name: str, 
         lead_guest_email: str
     ) -> str:
-        """Selects property card, populates lead guest information, and navigates to payment."""
+        """Selects property card, selects room, populates lead guest information, and navigates to payment."""
         await self.initialize()
 
-        cards = await self.page.query_selector_all("div[data-testid='property-card']")
+        cards = await self.page.query_selector_all(
+            "div[data-testid='property-card'], div[data-testid='property-card-container']"
+        )
         idx = int(option_index) - 1
 
-        if idx < len(cards):
-            title_link = await cards[idx].query_selector("a[data-testid='title-link']")
-            
-            # Handle new tab navigation if opened
-            async with self.context.expect_page() as new_page_info:
-                await title_link.click()
-            self.page = await new_page_info.value
-            await self.page.wait_for_load_state("domcontentloaded")
+        if 0 <= idx < len(cards):
+            title_link = await cards[idx].query_selector("a[data-testid='title-link'], a[href*='hotel']")
+            if title_link:
+                href = await title_link.get_attribute("href")
+                if href:
+                    if not href.startswith("http"):
+                        href = "https://www.booking.com" + href
+                    await self.page.goto(href, wait_until="domcontentloaded")
+                    await self.page.wait_for_timeout(2000)
 
-            # Reserve room button
-            reserve_btn = await self.page.wait_for_selector(
-                "button:has-text('Reserve'), button:has-text('Select'), button.hp_rt_input", 
-                timeout=10000
+            # 1. Select 1 room from room selection table dropdown if available
+            room_selects = await self.page.query_selector_all(
+                "select.hprt-nos-select, select[data-component='room-quantity-select']"
             )
+            if room_selects:
+                await room_selects[0].select_option("1")
+                await self.page.wait_for_timeout(1000)
+
+            # 2. Click reservation submission CTA button
+            reserve_btn = await self.page.query_selector(
+                "button.js-reservation-button, .hprt-reservation-cta button, button[data-component='reservation-button'], button#hp_book_now_button"
+            )
+            if not reserve_btn:
+                all_btns = await self.page.query_selector_all(".hprt-table button, .hprt-reservation-cta button, button")
+                for b in all_btns:
+                    txt = (await b.inner_text()).strip() if await b.inner_text() else ""
+                    if "reserve" in txt.lower():
+                        reserve_btn = b
+                        break
+
             if reserve_btn:
                 await reserve_btn.click()
+                try:
+                    await self.page.wait_for_load_state("domcontentloaded")
+                except Exception:
+                    pass
+                await self.page.wait_for_timeout(2000)
 
-            # Fill Guest Details
+            # 3. Fill Guest Details on booking checkout page (poll for inputs up to 10s)
             first_name = lead_guest_name.split()[0]
             last_name = lead_guest_name.split()[-1] if " " in lead_guest_name else "Guest"
 
-            first_input = await self.page.wait_for_selector("input[name='firstname']", timeout=5000)
+            first_input = None
+            for _ in range(20):
+                try:
+                    first_input = await self.page.query_selector(
+                        "input[name='firstname'], input#firstname, input[data-testid='firstname']"
+                    )
+                    if first_input:
+                        break
+                except Exception:
+                    pass
+                await self.page.wait_for_timeout(500)
+
             if first_input:
                 await first_input.fill(first_name)
 
-            last_input = await self.page.query_selector("input[name='lastname']")
-            if last_input:
-                await last_input.fill(last_name)
+                last_input = await self.page.query_selector(
+                    "input[name='lastname'], input#lastname, input[data-testid='lastname']"
+                )
+                if last_input:
+                    await last_input.fill(last_name)
 
-            email_input = await self.page.query_selector("input[name='email']")
-            if email_input:
-                await email_input.fill(lead_guest_email)
+                email_input = await self.page.query_selector(
+                    "input[name='email'], input#email, input[data-testid='email']"
+                )
+                if email_input:
+                    await email_input.fill(lead_guest_email)
 
-            # Proceed to final step
-            submit_btn = await self.page.query_selector("button[name='book']")
-            if submit_btn:
-                await submit_btn.click()
-                await self.page.wait_for_load_state("networkidle")
+                # Proceed to final details step
+                submit_btn = await self.page.query_selector(
+                    "button[name='book'], button:has-text('Next: Final details'), button:has-text('Final Details'), button[type='submit']"
+                )
+                if submit_btn:
+                    await submit_btn.click()
+                    await self.page.wait_for_load_state("domcontentloaded")
 
             return self.page.url
         return "Selected option index out of bounds."
@@ -237,8 +306,10 @@ class PlaywrightAccommodationEngine:
     async def close(self):
         if self.context:
             await self.context.close()
+            self.context = None
         if self.playwright:
             await self.playwright.stop()
+            self.playwright = None
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +319,8 @@ class AccommodationAgentModule:
     """Sub-Agent wrapper structured to accept payload objects from an Orchestrator."""
 
     def __init__(self, api_key: Optional[str] = None, user_data_dir: str = "./hotel_playwright_data"):
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-
+        self.user_data_dir = user_data_dir
+        self.api_key = api_key or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         self.engine = PlaywrightAccommodationEngine(user_data_dir=user_data_dir)
         self.tools = self._bind_tools()
         self.executor = self._build_executor()
@@ -286,7 +356,7 @@ class AccommodationAgentModule:
             return f"Navigated to payment checkout page: {checkout_url}."
 
         @tool
-        async def listen_for_hotel_confirmation(timeout_seconds: int = 300) -> str:
+        async def listen_for_hotel_confirmation(timeout_seconds: int = 15) -> str:
             """Prompts user on-screen to make payment, then listens and scrapes final Reservation ID."""
             result = await AccommodationPromptHandler.prompt_for_payment_and_wait(engine.page, timeout_seconds)
             return str(result)
@@ -309,7 +379,21 @@ class AccommodationAgentModule:
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # Priority 1: Groq LLM
+        if os.getenv("GROQ_API_KEY"):
+            from langchain_groq import ChatGroq
+            llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"))
+        # Priority 2: OpenAI LLM
+        elif os.getenv("OPENAI_API_KEY"):
+            from langchain_openai import ChatOpenAI
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # Priority 3: Google Gemini LLM
+        elif os.getenv("GOOGLE_API_KEY"):
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        else:
+            raise ValueError("No valid API key (GROQ_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY) found in environment.")
+
         agent = create_openai_tools_agent(llm, self.tools, prompt)
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True)
 
@@ -354,7 +438,6 @@ class AccommodationAgentModule:
 # 4. EXAMPLE ASYNC INVOCATION
 # ---------------------------------------------------------------------------
 async def main():
-    # Ensure OPENAI_API_KEY environment variable is set
     hotel_agent = AccommodationAgentModule()
 
     try:

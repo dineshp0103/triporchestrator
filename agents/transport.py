@@ -273,19 +273,25 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium_stealth import stealth
 
-from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_classic.agents import create_openai_tools_agent
-from langchain_classic.agents import AgentExecutor
+try:
+    from langchain_classic.agents import create_openai_tools_agent, AgentExecutor
+except ImportError:
+    from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-
 print("Checking env files")
-if load_dotenv():
-    print("ENV files loaded")
-else :
-    print("ENV issue")
-    exit(1)
+env_file_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_file_path):
+    load_dotenv(env_file_path)
+else:
+    load_dotenv()
+
+api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if api_key:
+    print("ENV files loaded successfully")
+else:
+    print("Warning: No valid API key found in environment variables.")
 # ---------------------------------------------------------------------------
 # 1. STATION CODE RESOLVER MAPPING
 # ---------------------------------------------------------------------------
@@ -601,7 +607,21 @@ class IRCTCTransportAgentModule:
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # Priority 1: Groq LLM
+        if os.getenv("GROQ_API_KEY"):
+            from langchain_groq import ChatGroq
+            llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"))
+        # Priority 2: OpenAI LLM
+        elif os.getenv("OPENAI_API_KEY"):
+            from langchain_openai import ChatOpenAI
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # Priority 3: Google Gemini LLM
+        elif os.getenv("GOOGLE_API_KEY"):
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        else:
+            raise ValueError("No valid API key (GROQ_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY) found in environment.")
+
         agent = create_openai_tools_agent(llm, self.tools, prompt)
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True)
 
