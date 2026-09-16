@@ -1,15 +1,14 @@
 # 🧳 TripOrchestrator: Multi-Agent Autonomous Tour & Travel System
 
-> **Hackathon Track:** AI Agents & Autonomous Workflows  
-> **Built With:** LangChain, LangGraph, Python, Streamlit, OpenWeather API, Geopy, ChatGroq / OpenAI  
+> **Built With:** LangChain, LangGraph, Python, Streamlit, OpenWeather API, Playwright, Selenium, ChatGroq / OpenAI / Google Gemini  
 
 ---
 
 ## 📌 Executive Summary
 
-Planning multi-city travel involves juggling complex variables: checking live weather forecasts, calculating physical distances, selecting accommodation, booking transit, and handling payments securely. Single-prompt AI solutions frequently hallucinate details, misuse APIs, or perform actions without user consent.
+Planning multi-city travel involves juggling complex variables: checking live weather forecasts, discovering local attractions, selecting hotels, and searching train availability. Single-prompt AI solutions frequently hallucinate details, misuse APIs, or perform actions without user consent.
 
-**TripOrchestrator** addresses these limitations using a **Hierarchical Multi-Agent Architecture** powered by **LangGraph**. By decoupling responsibilities into specialized sub-agents and enforcing **Human-in-the-Loop (HITL)** checkpoints, the system automates end-to-end travel planning—from itinerary drafting to checkout preparation—while keeping users in total control before any payment execution.
+**TripOrchestrator** addresses these limitations using a **Hierarchical Multi-Agent Architecture** powered by **LangGraph** and **Streamlit**. By decoupling responsibilities into specialized sub-agents (Weather, Tour Guide, Hotel Booking, Train Transport) and employing dynamic LLM front-door conversation routing, the system automates end-to-end travel planning—from itinerary drafting to hotel and transit lookup—with real-time UI agent connection progress tracking.
 
 ---
 
@@ -17,92 +16,83 @@ Planning multi-city travel involves juggling complex variables: checking live we
 
 ```text
 triporchestrator/
-├── README.md                 ← judges read this first
-├── requirements.txt
-├── .env.example              ← names of keys needed (OPENWEATHERMAP_API_KEY, GROQ_API_KEY), never real keys
-├── app.py                    ← Streamlit UI entry point (streamlit run app.py)
-├── run.py                    ← single entry point: python run.py --query "Plan 2-day trip to Tirupati"
+├── README.md                       ← Comprehensive project overview
+├── main.py                         ← Streamlit launch forwarding entry point
+├── pyproject.toml / requirements.txt ← Project dependencies
+├── src/
+│   └── triporchestrator/
+│       └── app.py                  ← Streamlit Web UI application & resource caching
 ├── agents/
-│   ├── tour_guide.py          ← geocodes landmarks & parses locations
-│   ├── weather.py             ← queries OpenWeather API (v2.5/4.0)
-│   ├── transport.py           ← checks transit & fare options
-│   ├── booking.py             ← handles hotel reservations
-│   └── orchestrator.py        ← main supervisor agent & human-in-the-loop (HITL) payment flow
-├── eval/
-│   ├── testset.csv            ← 20 hardcoded queries + expected agent outputs
-│   ├── run_eval.py            ← evaluates confidence thresholds & run traces
-│   └── results.md             ← confidence score logs & accuracy metrics
-└── runs/                      ← execution decision traces & state checkpointer logs
+│   ├── llm_convo.py                 ← Front-door dynamic LLM chat & orchestration router
+│   ├── orchestra.py                 ← LangGraph supervisor & workflow graph compiler
+│   ├── guide.py                     ← Tour Guide (Trippy) itinerary & attraction agent
+│   ├── weather_agent.py             ← OpenWeather API forecast agent
+│   ├── booking.py                   ← Playwright automation agent for Booking.com
+│   └── transport.py                 ← Selenium automation agent for IRCTC train availability
+└── hotel_playwright_data/          ← Persistent browser context data
 ```
+
+---
 
 ## 🛠 Architecture & Agent Workflow
 
-The engine models agent states using a unified `TypedDict` and coordinates workflow transitions via a **StateGraph**.
+The engine models agent states using a unified `TypedDict` and coordinates workflow transitions via a LangGraph **StateGraph**.
 
 ```text
-                          +-------------------------------+
-                          |    Supervisor Orchestrator    |
-                          +---------------+---------------+
-                                          |
-        +---------------------------------+---------------------------------+
-        |                                 |                                 |
-+-------v-------+                 +-------v-------+                 +-------v-------+
-|  Tour Guide   |                 | Weather Agent |                 |Transport Agent|
-|     Agent     |                 +-------+-------+                 +-------+-------+
-+-------+-------+                         |                                 |
-        |                         +-------v-------+                         |
-        +------------------------>| Check Weather |                         |
-                                  |     Gate      |                         |
-                                  +-------+-------+                         |
-                                          | (Suitable)                      |
-                                          v                                 v
-                                  +---------------+                 +---------------+
-                                  | Booking Agent |<----------------+   Execution   |
-                                  +-------+-------+                 +---------------+
-                                          |
-                                          v
-                                 🛑 [HITL INTERRUPT]
-                                  (Human Approval)
-                                          |
-                                          v (Approved)
-                                +-------------------+
-                                |     Booking       |
-                                |   Orchestrator    |
-                                +-------------------+
-
+                           +-------------------------------+
+                           |    Supervisor Orchestrator    |
+                           +---------------+---------------+
+                                           |
+         +---------------------------------+---------------------------------+
+         |                                 |                                 |
++--------v-------+                +--------v-------+                +--------v-------+
+|   Tour Guide   |                | Weather Agent  |                | Transport Agent|
+| (Trippy Agent) |                +--------+-------+                +--------+-------+
++--------+-------+                         |                                 |
+         |                         +-------v-------+                         |
+         +------------------------>| Check Weather |                         |
+                                   +-------+-------+                         |
+                                           |                                 v
+                                           v                        +----------------+
+                                   +---------------+                | Booking Agent  |
+                                   | Hotel Search  |<---------------+  (Booking.com) |
+                                   +---------------+                +----------------+
 ```
 
 ### 🤖 Agent Roles & Responsibilities
 
 | Agent | File | Primary Responsibility |
 | :--- | :--- | :--- |
-| **Supervisor Orchestrator** | `agents/orchestrator.py` | Receives global user state, handles task delegation, and synthesizes sub-agent outputs. |
-| **Tour Guide Agent** | `agents/tour_guide.py` | Extracts tourist attraction metadata, geocodes locations via `geopy`/Nominatim, and determines if overnight stay is required (`is_far_destination`). |
-| **Weather Agent** | `agents/weather.py` | Queries OpenWeather API endpoints (2.5/4.0 `/daily`) for 5-day forecasts and checks weather safety constraints. |
-| **Transport Agent** | `agents/transport.py` | Evaluates travel distance and identifies transit choices (train, flight, cab options). |
-| **Booking Agent** | `agents/booking.py` | Generates lodging and room reservations if `is_far_destination == True`. |
+| **Front-Door LLM Chat** | `agents/llm_convo.py` | Handles general Q&A, greetings ("Hi"), and capability questions dynamically using LLM, and evaluates when multi-agent orchestration is needed. |
+| **Supervisor Orchestrator** | `agents/orchestra.py` | LangGraph supervisor routing travel planning state across specialized sub-agents until requests are complete. |
+| **Tour Guide (Trippy)** | `agents/guide.py` | Energetic itinerary planner providing daily schedules, attraction recommendations, and local travel advice. |
+| **Weather Agent** | `agents/weather_agent.py` | Queries live weather forecasts for destination cities. |
+| **Booking Agent** | `agents/booking.py` | Automated Playwright browser engine for real-time accommodation search on Booking.com. |
+| **Transport Agent** | `agents/transport.py` | Automated Selenium browser engine for IRCTC train seat availability and route searches. |
 
+---
 
 ## ⚙️ Key Technical Features
 
-* **Deterministic State Routing (LangGraph):** Replaces volatile single-prompt loops with structured graphs, state transitions, and conditional edges.
-* **Human-in-the-Loop (HITL) Guardrails:** Pauses graph execution right before financial operations using LangGraph `interrupt()` state checkpointers.
-* **Real-time Geocoding & Weather Integration:** Dynamically translates landmark and city names into coordinates using `geopy` before querying live OpenWeather APIs.
-* **Evaluation Framework & Trace Logging:** Evaluates agent confidence thresholds and saves execution decision traces across test query sets inside `eval/` and `runs/`.
-* **Interactive Streamlit Interface:** Provides a dynamic web UI that streams multi-agent decision steps live and displays an interactive approval card when HITL checkpoints trigger.
+* **Dynamic Front-Door Conversation Routing (`llm_convo.py`):** Differentiates casual greetings ("Hi", "Hello, What can you do") from travel requests, responding dynamically without static or repetitive templates.
+* **Sub-5ms UI Load Performance (`@st.cache_resource`):** Heavy agent modules, LLM models, and LangGraph workflows are cached in memory on app startup, eliminating rerun latency during interaction.
+* **Real-time Web UI Connection Progress:** Streamlit `st.status` displays step-by-step progress cards (`Connected with weather agent for weather report`, `Weather report Generated`) with glowing CSS loading pulse animations.
+* **Autonomous Web Browser Agents:** Playwright and Selenium headless/headful automation for real-time hotel and train ticket checks.
+
+---
 
 ## ⚡ Quickstart & Setup Guide
 
 ### 1. Prerequisites
 * **Python 3.10+**
-* OpenWeatherMap API Key
-* Groq API Key or OpenAI API Key
+* API Key for **Groq**, **OpenAI**, or **Google Gemini**
+* OpenWeatherMap API Key (optional)
 
 ### 2. Environment Setup
 
 ```bash
 # Clone repository
-git clone [https://github.com/your-username/triporchestrator.git](https://github.com/your-username/triporchestrator.git)
+git clone https://github.com/dineshp0103/triporchestrator.git
 cd triporchestrator
 
 # Create and activate virtual environment
@@ -111,14 +101,35 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
-OPENWEATHERMAP_API_KEY="your_openweather_api_key"
+### 3. Add API Keys
+Create or update `agents/.env`:
+
+```env
 GROQ_API_KEY="your_groq_api_key"
 OPENAI_API_KEY="your_openai_api_key"
-
-streamlit run app.py
-
-python run.py --query "Plan a 2-day trip to Tirupati from Visakhapatnam"
-
-python eval/run_eval.py
+GOOGLE_API_KEY="your_google_api_key"
 ```
+
+### 4. Launch Application
+
+```bash
+streamlit run main.py
+```
+
+Or open directly via python:
+
+```bash
+python main.py
+```
+
+---
+
+## 🌐 Deploy to Streamlit Community Cloud
+
+1. Push code to your GitHub repository: `https://github.com/dineshp0103/triporchestrator`
+2. Open **[share.streamlit.io](https://share.streamlit.io)** and click **New app**.
+3. Select Repository `dineshp0103/triporchestrator`, Branch `main`, and Main file path `main.py`.
+4. Under **Advanced settings... -> Secrets**, configure your API keys (`GROQ_API_KEY`, `OPENAI_API_KEY`, etc.).
+5. Click **Deploy!**
