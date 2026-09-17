@@ -1,6 +1,10 @@
 import os
 import sys
+import html
+import time
+import queue
 import asyncio
+import threading
 import concurrent.futures
 import streamlit as st
 
@@ -39,6 +43,145 @@ def run_async_coro(coro):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         return ex.submit(_worker).result()
+
+
+AGENT_UI = {
+    "Supervisor": {"icon": "🧭", "label": "Orchestrator"},
+    "Weather": {"icon": "🌦️", "label": "Weather"},
+    "TourGuide": {"icon": "🗺️", "label": "Tour Guide"},
+    "Booking": {"icon": "🏨", "label": "Booking"},
+    "Transport": {"icon": "🚆", "label": "Transport"},
+    "FINISH": {"icon": "✅", "label": "Finish"},
+    "Finish": {"icon": "✅", "label": "Finish"},
+}
+
+TIMER_AGENTS = ("Supervisor", "Weather", "TourGuide", "Booking", "Transport")
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - minutes * 60
+    return f"{minutes}m {rem:04.1f}s"
+
+
+def _latest_interaction(interactions, agent):
+    for item in reversed(interactions):
+        if item["agent"] == agent:
+            return item
+    return None
+
+
+def render_timer_board(orch_start: float, interactions: list, now: float) -> str:
+    total = _fmt_duration(now - orch_start)
+    cards = []
+    for agent in TIMER_AGENTS:
+        meta = AGENT_UI[agent]
+        elapsed_s = 0.0
+        seen = False
+        running = False
+        for item in interactions:
+            if item["agent"] != agent:
+                continue
+            seen = True
+            end = item["end"] if item["end"] is not None else now
+            elapsed_s += max(0.0, end - item["start"])
+            if item["end"] is None:
+                running = True
+        if not seen:
+            state, css, elapsed = "waiting", "idle", "—"
+        elif running:
+            state, css, elapsed = "running", "running", _fmt_duration(elapsed_s)
+        else:
+            state, css, elapsed = "done", "done", _fmt_duration(elapsed_s)
+        cards.append(
+            f'<div class="orch-timer-card {css}">'
+            f'<div class="orch-timer-agent">{meta["icon"]} {html.escape(meta["label"])}</div>'
+            f'<div class="orch-timer-value">{elapsed}</div>'
+            f'<div class="orch-timer-state">{state}</div>'
+            f"</div>"
+        )
+    return (
+        f'<div class="orch-total">⏱ Total interaction time: {total}</div>'
+        f'<div class="orch-timer-board">{"".join(cards)}</div>'
+    )
+
+
+def render_thought_stream(thoughts: list) -> str:
+    if not thoughts:
+        return (
+            '<div class="thought-stream">'
+            '<div class="thought-line thought-meta">Waiting for the orchestrator to think…</div>'
+            "</div>"
+        )
+    lines = []
+    for item in thoughts[-40:]:
+        meta = AGENT_UI.get(item["agent"], {"icon": "🤖", "label": item["agent"]})
+        stamp = _fmt_duration(item.get("elapsed", 0.0))
+        text = html.escape(item.get("text") or "")
+        lines.append(
+            f'<div class="thought-line">'
+            f'<span class="thought-meta">{stamp}</span> · '
+            f'{meta["icon"]} <strong>{html.escape(meta["label"])}</strong> — {text}'
+            "</div>"
+        )
+    return f'<div class="thought-stream">{"".join(lines)}</div>'
+
+
+def _unpack_stream_item(item):
+    if isinstance(item, dict) and item.get("type") in {
+        "custom", "updates", "values", "messages", "tasks", "debug"
+    } and "data" in item:
+        return item["type"], item["data"]
+    if isinstance(item, dict) and item.get("type") in ("agent_start", "agent_end", "thought"):
+        return "custom", item
+    if isinstance(item, tuple):
+        if len(item) == 3:
+            return item[1], item[2]
+        if len(item) == 2 and isinstance(item[0], str):
+            return item[0], item[1]
+    return "updates", item
+
+
+def _message_text(message) -> str:
+    content = getattr(message, "content", message)
+    return content if isinstance(content, str) else str(content)
+
+
+def stream_orchestrator_to_queue(msgs_snapshot, event_q: queue.Queue):
+    """Run the graph in a background thread and push live chunks to the UI."""
+
+    async def _run():
+        graph = build_orchestrator_graph()
+        hm = [HumanMessage(content=c) for c in msgs_snapshot]
+        try:
+            try:
+                stream = graph.astream(
+                    {"messages": hm},
+                    stream_mode=["custom", "updates"],
+                    version="v2",
+                )
+            except TypeError:
+                stream = graph.astream(
+                    {"messages": hm},
+                    stream_mode=["custom", "updates"],
+                )
+            async for item in stream:
+                event_q.put(("chunk", item))
+        except Exception as exc:
+            event_q.put(("error", exc))
+        finally:
+            event_q.put(("done", None))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
 
 # ── Cached Agent Imports ──────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False, ttl=60)  # Cache for 60 seconds to allow updates
@@ -199,6 +342,77 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 /* Chat bubbles extra spacing */
 [data-testid="stChatMessage"] { margin-bottom: 0.4rem; }
+
+.orch-total {
+    font-variant-numeric: tabular-nums;
+    color: #38BDF8;
+    font-weight: 700;
+    font-size: 0.95rem;
+    margin: 0.15rem 0 0.55rem 0;
+}
+.orch-timer-board {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+    margin-bottom: 0.75rem;
+}
+.orch-timer-card {
+    flex: 1 1 140px;
+    background: #1E293B;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 0.65rem 0.8rem;
+    min-width: 132px;
+}
+.orch-timer-card.running {
+    border-color: rgba(56, 189, 248, 0.75);
+    animation: glowPulse 2s infinite ease-in-out;
+}
+.orch-timer-card.done {
+    border-color: rgba(74, 222, 128, 0.35);
+}
+.orch-timer-card.idle {
+    opacity: 0.55;
+}
+.orch-timer-agent {
+    font-size: 0.75rem;
+    color: #94A3B8;
+    font-weight: 600;
+    margin-bottom: 0.15rem;
+}
+.orch-timer-value {
+    font-size: 1.28rem;
+    font-weight: 800;
+    color: #F8FAFC;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+}
+.orch-timer-state {
+    font-size: 0.72rem;
+    color: #64748B;
+    margin-top: 0.1rem;
+}
+.thought-stream {
+    background: #0F172A;
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px;
+    padding: 0.7rem 0.9rem;
+    max-height: 260px;
+    overflow-y: auto;
+    font-size: 0.86rem;
+    line-height: 1.5;
+    margin-bottom: 0.6rem;
+}
+.thought-line {
+    color: #CBD5E1;
+    margin: 0.2rem 0;
+    animation: fadeInUp 0.25s ease-out;
+}
+.thought-meta {
+    color: #64748B;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -392,165 +606,188 @@ if page == "chat":
                 if m["role"] == "user"
             ]
 
-            AGENT_CONNECT_LOGS = {
-                "Weather": "Connected with weather agent for weather report",
-                "TourGuide": "Connected with tour guide agent for itinerary recommendations",
-                "Booking": "Connected with booking agent for hotel search",
-                "Transport": "Connected with transport agent to see the transport availability",
-            }
-
-            AGENT_COMPLETE_LOGS = {
-                "Weather": "Weather report Generated",
-                "TourGuide": "Tour guide itinerary Generated",
-                "Booking": "Hotel booking options Generated",
-                "Transport": "Transport Availability Report Generated",
-            }
-
             with st.chat_message("assistant", avatar="🤖"):
+                timer_box = st.empty()
+                thought_box = st.empty()
                 status_container = st.status("🤖 Orchestrating agents…", expanded=True)
-                
-                # Agent icons mapping
-                agent_icons = {
-                    "Weather": "🌦️",
-                    "TourGuide": "🗺️",
-                    "Booking": "🏨",
-                    "Transport": "🚆",
-                    "FINISH": "✅"
-                }
-                
-                import time
+
                 start_time = time.time()
-                displayed_steps = set()
+                interactions = []
+                thoughts = []
                 responses = []
+                direct_reply = None
+                event_q = queue.Queue()
+                worker = threading.Thread(
+                    target=stream_orchestrator_to_queue,
+                    args=(msgs_snapshot, event_q),
+                    daemon=True,
+                )
+                worker.start()
 
-                async def _run_and_collect():
-                    """Collect all updates from the graph stream."""
-                    graph = build_orchestrator_graph()
-                    hm = [HumanMessage(content=c) for c in msgs_snapshot]
-                    
-                    updates_list = []
-                    agent_flow = []
-                    
-                    print(f"\n[DEBUG] Starting graph execution")
-                    
-                    async for chunk in graph.astream({"messages": hm}):
-                        for node, update in chunk.items():
-                            print(f"[DEBUG] Node: {node}, Keys: {list(update.keys())}")
-                            
-                            # Collect Supervisor reasoning
-                            if node == "Supervisor":
-                                if "reasoning" in update:
-                                    step = update.get("current_step", 0)
-                                    next_agent = update.get("next")
-                                    reasoning = update["reasoning"]
-                                    
-                                    if step not in displayed_steps:
-                                        elapsed = time.time() - start_time
-                                        icon = agent_icons.get(next_agent, "🤖")
-                                        
-                                        updates_list.append({
-                                            "type": "reasoning",
-                                            "step": step,
-                                            "agent": next_agent,
-                                            "reasoning": reasoning,
-                                            "elapsed": elapsed,
-                                            "icon": icon
-                                        })
-                                        displayed_steps.add(step)
-                                        print(f"[DEBUG] ✓ Reasoning collected: {reasoning[:50]}...")
-                                    
-                                if "agent_flow" in update:
-                                    agent_flow = update["agent_flow"]
-                            
-                            # Collect agent execution status
-                            elif node in ["Weather", "TourGuide", "Booking", "Transport"]:
-                                # Agent started
-                                updates_list.append({
-                                    "type": "agent_start",
-                                    "agent": node
-                                })
-                                print(f"[DEBUG] ✓ {node} started")
-                                
-                                # Agent completed
-                                if "messages" in update:
-                                    updates_list.append({
-                                        "type": "agent_complete",
-                                        "agent": node
-                                    })
-                                    
-                                    responses.append({
-                                        "agent": node,
-                                        "content": update["messages"][-1].content,
-                                    })
-                                    print(f"[DEBUG] ✓ {node} completed")
-                    
-                    return updates_list, agent_flow
-
-                try:
-                    # Collect all updates
-                    updates_list, agent_flow = run_async_coro(_run_and_collect())
-                    
-                    # Now render all updates on the main thread (with Streamlit context)
-                    for update_item in updates_list:
-                        if update_item["type"] == "reasoning":
-                            status_container.write(
-                                f"**Step {update_item['step']}** ({update_item['elapsed']:.1f}s) → "
-                                f"{update_item['icon']} **{update_item['agent']}**  \n"
-                                f"_{update_item['reasoning']}_"
-                            )
-                        elif update_item["type"] == "agent_start":
-                            badge_html = f'''
-                            <div class="agent-loading-badge">
-                                <div class="spinner-ring"></div>
-                                <span>{update_item['agent']} agent is working...</span>
-                            </div>
-                            '''
-                            status_container.markdown(badge_html, unsafe_allow_html=True)
-                        elif update_item["type"] == "agent_complete":
-                            badge_html = f'''
-                            <div class="agent-done-badge">
-                                <span>✓</span>
-                                <span>{update_item['agent']} agent completed</span>
-                            </div>
-                            '''
-                            status_container.markdown(badge_html, unsafe_allow_html=True)
-                    
-                    # Display timeline summary
-                    if agent_flow:
-                        total_time = time.time() - start_time
-                        status_container.write(f"\n**Total orchestration time:** {total_time:.2f}s")
-                        
-                        status_container.write("**Agent execution times:**")
-                        for entry in agent_flow:
-                            duration = entry.get("end_time", time.time()) - entry["start_time"]
-                            status_container.write(f"  - {entry['agent']}: {duration:.2f}s")
-                    
-                    status_container.update(label="🎉 Orchestration Complete!", state="complete", expanded=False)
-
-                    if responses:
-                        parts = [
-                            f"**[{r['agent']}]**\n\n{r['content']}"
-                            for r in responses
-                        ]
-                        reply = "\n\n---\n\n".join(parts)
-                    else:
-                        reply = (
-                            "✅ I've processed your request. "
-                            "Anything else about your trip?"
-                        )
-
-                    st.markdown(reply)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": reply}
+                def _refresh_live_ui(now):
+                    timer_box.markdown(
+                        render_timer_board(start_time, interactions, now),
+                        unsafe_allow_html=True,
+                    )
+                    thought_box.markdown(
+                        render_thought_stream(thoughts),
+                        unsafe_allow_html=True,
                     )
 
+                def _append_thought(agent, text, ts=None):
+                    if not text:
+                        return
+                    if thoughts and thoughts[-1]["agent"] == agent and thoughts[-1]["text"] == text:
+                        return
+                    thoughts.append({
+                        "agent": agent,
+                        "text": text,
+                        "elapsed": (ts or time.time()) - start_time,
+                    })
+
+                def _start_interaction(agent, ts):
+                    current = _latest_interaction(interactions, agent)
+                    if current and current["end"] is None:
+                        return
+                    interactions.append({
+                        "agent": agent,
+                        "start": ts,
+                        "end": None,
+                    })
+                    meta = AGENT_UI.get(agent, {"icon": "🤖", "label": agent})
+                    status_container.update(
+                        label=f"{meta['icon']} {meta['label']} is working…",
+                        state="running",
+                    )
+
+                def _end_interaction(agent, ts):
+                    for item in reversed(interactions):
+                        if item["agent"] == agent and item["end"] is None:
+                            item["end"] = ts
+                            elapsed = item["end"] - item["start"]
+                            meta = AGENT_UI.get(agent, {"icon": "🤖", "label": agent})
+                            status_container.write(
+                                f"{meta['icon']} **{meta['label']}** finished in `{_fmt_duration(elapsed)}`"
+                            )
+                            break
+
+                try:
+                    _refresh_live_ui(start_time)
+                    done = False
+                    run_error = None
+                    while not done:
+                        now = time.time()
+                        _refresh_live_ui(now)
+                        try:
+                            kind, payload = event_q.get(timeout=0.12)
+                        except queue.Empty:
+                            continue
+
+                        if kind == "done":
+                            done = True
+                            continue
+                        if kind == "error":
+                            run_error = payload
+                            done = True
+                            continue
+
+                        mode, data = _unpack_stream_item(payload)
+                        now = time.time()
+
+                        if mode == "custom" and isinstance(data, dict):
+                            event_type = data.get("type")
+                            agent = data.get("agent") or "Supervisor"
+                            ts = float(data.get("ts") or now)
+                            text = data.get("text")
+                            if event_type == "agent_start":
+                                _start_interaction(agent, ts)
+                                _append_thought(agent, text or f"{agent} started.", ts)
+                            elif event_type == "agent_end":
+                                _end_interaction(agent, ts)
+                            elif event_type == "thought":
+                                routed = data.get("next")
+                                if routed and routed not in (None, "FINISH"):
+                                    text = f"{text} → {routed}"
+                                _append_thought(agent, text, ts)
+
+                        elif mode == "updates" and isinstance(data, dict):
+                            for node, update in data.items():
+                                if not isinstance(update, dict):
+                                    continue
+                                if node == "Supervisor":
+                                    current = _latest_interaction(interactions, "Supervisor")
+                                    if current is None:
+                                        _start_interaction("Supervisor", now)
+                                    _end_interaction("Supervisor", now)
+                                    if update.get("direct_reply"):
+                                        direct_reply = update["direct_reply"]
+                                elif node in ("Weather", "TourGuide", "Booking", "Transport"):
+                                    current = _latest_interaction(interactions, node)
+                                    if current is None:
+                                        _start_interaction(node, now)
+                                    _end_interaction(node, now)
+                                    if "messages" in update and update["messages"]:
+                                        responses.append({
+                                            "agent": node,
+                                            "content": _message_text(update["messages"][-1]),
+                                        })
+                                elif node in ("Finish", "FINISH"):
+                                    if "messages" in update and update["messages"] and not direct_reply:
+                                        direct_reply = _message_text(update["messages"][-1])
+
+                    for item in interactions:
+                        if item["end"] is None:
+                            item["end"] = time.time()
+
+                    end_time = time.time()
+                    _refresh_live_ui(end_time)
+
+                    if run_error:
+                        status_container.update(label="❌ Error", state="error")
+                        st.error(f"⚠️ {friendly_error(run_error)}")
+                    else:
+                        status_container.write(
+                            f"**Total orchestration time:** `{_fmt_duration(end_time - start_time)}`"
+                        )
+                        if interactions:
+                            status_container.write("**Agent interaction times:**")
+                            for item in interactions:
+                                meta = AGENT_UI.get(item["agent"], {"icon": "🤖", "label": item["agent"]})
+                                status_container.write(
+                                    f"- {meta['icon']} {meta['label']}: `{_fmt_duration(item['end'] - item['start'])}`"
+                                )
+                        status_container.update(
+                            label="🎉 Orchestration Complete!",
+                            state="complete",
+                            expanded=False,
+                        )
+
+                        if responses:
+                            parts = [
+                                f"**[{r['agent']}]**\n\n{r['content']}"
+                                for r in responses
+                            ]
+                            reply = "\n\n---\n\n".join(parts)
+                        elif direct_reply:
+                            reply = direct_reply
+                        else:
+                            reply = (
+                                "✅ I've processed your request. "
+                                "Anything else about your trip?"
+                            )
+
+                        st.markdown(reply)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": reply}
+                        )
                 except Exception as exc:
-                    # Show error in the status container
                     status_container.update(label="❌ Error", state="error")
                     st.error(f"⚠️ {friendly_error(exc)}")
                     import traceback
-                    print(f"[ERROR] Orchestration failed:")
+                    print("[ERROR] Orchestration failed:")
                     traceback.print_exc()
+                finally:
+                    worker.join(timeout=2)
 
 
 # ════════════════════════════════════════════════════════════════════════════

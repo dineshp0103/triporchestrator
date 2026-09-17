@@ -6,9 +6,9 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 try:
-    from langchain_classic.agents import AgentExecutor, create_openai_tools_agent
+    from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 except ImportError:
-    from langchain.agents import AgentExecutor, create_openai_tools_agent
+    from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # Ensure UTF-8 output encoding for Windows console (handles unicode symbols like ₹, €, etc.)
@@ -394,7 +394,7 @@ class AccommodationAgentModule:
         else:
             raise ValueError("No valid API key (GROQ_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY) found in environment.")
 
-        agent = create_openai_tools_agent(llm, self.tools, prompt)
+        agent = create_tool_calling_agent(llm, self.tools, prompt)
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True)
 
     async def run_orchestrated_booking(

@@ -1,5 +1,7 @@
 import os
+import time
 import asyncio
+from contextvars import ContextVar
 from typing import Annotated, Literal, Optional, TypedDict
 from pydantic import BaseModel
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
@@ -7,6 +9,47 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_classic.agents import tool
 from dotenv import load_dotenv
+
+_UI_WRITER: ContextVar = ContextVar("ui_writer", default=None)
+
+
+def _stream_event(event: dict) -> None:
+    """Push a live thought/timer event to the UI when the graph is streaming."""
+    payload = {**event, "ts": event.get("ts", time.time())}
+    writer = _UI_WRITER.get()
+    if writer is not None:
+        try:
+            writer(payload)
+            return
+        except Exception:
+            pass
+    try:
+        from langgraph.config import get_stream_writer
+
+        get_stream_writer()(payload)
+    except Exception:
+        pass
+
+
+def _mark_flow_complete(state: dict, agent_name: str) -> list:
+    agent_flow = list(state.get("agent_flow") or [])
+    for entry in reversed(agent_flow):
+        if entry.get("agent") == agent_name and entry.get("status") in ("pending", "active"):
+            entry["status"] = "completed"
+            entry["end_time"] = time.time()
+            break
+    return agent_flow
+
+
+def _mark_flow_active(state: dict, agent_name: str) -> list:
+    agent_flow = list(state.get("agent_flow") or [])
+    now = time.time()
+    for entry in reversed(agent_flow):
+        if entry.get("agent") == agent_name and entry.get("status") in ("pending", "active"):
+            entry["status"] = "active"
+            entry["start_time"] = now
+            break
+    return agent_flow
 
 print("All Modules are imported...")
 
@@ -72,79 +115,120 @@ print("Agents was initiated...")
 # ---------------------------------------------------------------------------
 # 4. Node Definitions Wrapping Sub-Agents
 # ---------------------------------------------------------------------------
-def weather_node(state: OrchestratorState):
-    import time
-    latest_user_input = state["messages"][-1].content
-    response = weather_executor.invoke({"input": latest_user_input})
-    
-    # Update agent flow to mark as completed
-    agent_flow = state.get("agent_flow", [])
-    for entry in reversed(agent_flow):
-        if entry["agent"] == "Weather" and entry["status"] in ["pending", "active"]:
-            entry["status"] = "completed"
-            entry["end_time"] = time.time()
-            break
-    
-    return {
-        "messages": [HumanMessage(content=f"[Weather Agent Response]: {response['output']}")],
-        "agent_flow": agent_flow,
-    }
+def weather_node(state: OrchestratorState, writer=None):
+    _tok = _UI_WRITER.set(writer) if writer is not None else None
+    try:
+        agent_flow = _mark_flow_active(state, "Weather")
+        _stream_event({
+            "type": "agent_start",
+            "agent": "Weather",
+            "text": "Connected with the weather agent. Fetching a live forecast…",
+        })
+        latest_user_input = state["messages"][-1].content
+        _stream_event({
+            "type": "thought",
+            "agent": "Weather",
+            "text": "Calling weather tools for the requested destination.",
+        })
+        try:
+            response = weather_executor.invoke({"input": latest_user_input})
+            output = response["output"]
+            _stream_event({"type": "thought", "agent": "Weather", "text": "Weather report generated."})
+            return {
+                "messages": [HumanMessage(content=f"[Weather Agent Response]: {output}")],
+                "agent_flow": _mark_flow_complete({"agent_flow": agent_flow}, "Weather"),
+            }
+        finally:
+            _stream_event({"type": "agent_end", "agent": "Weather"})
+    finally:
+        if _tok is not None:
+            _UI_WRITER.reset(_tok)
 
 
-def tour_guide_node(state: OrchestratorState):
-    import time
-    response = tour_guide_agent.invoke(state)
-    
-    # Update agent flow to mark as completed
-    agent_flow = state.get("agent_flow", [])
-    for entry in reversed(agent_flow):
-        if entry["agent"] == "TourGuide" and entry["status"] in ["pending", "active"]:
-            entry["status"] = "completed"
-            entry["end_time"] = time.time()
-            break
-    
-    return {
-        "messages": [response["messages"][-1]],
-        "agent_flow": agent_flow,
-    }
+def tour_guide_node(state: OrchestratorState, writer=None):
+    _tok = _UI_WRITER.set(writer) if writer is not None else None
+    try:
+        agent_flow = _mark_flow_active(state, "TourGuide")
+        _stream_event({
+            "type": "agent_start",
+            "agent": "TourGuide",
+            "text": "Connected with the tour guide agent for itinerary recommendations…",
+        })
+        _stream_event({
+            "type": "thought",
+            "agent": "TourGuide",
+            "text": "Trippy is drafting sights, pacing, and local tips.",
+        })
+        try:
+            response = tour_guide_agent.invoke(state)
+            _stream_event({"type": "thought", "agent": "TourGuide", "text": "Tour guide itinerary generated."})
+            return {
+                "messages": [response["messages"][-1]],
+                "agent_flow": _mark_flow_complete({"agent_flow": agent_flow}, "TourGuide"),
+            }
+        finally:
+            _stream_event({"type": "agent_end", "agent": "TourGuide"})
+    finally:
+        if _tok is not None:
+            _UI_WRITER.reset(_tok)
 
 
-async def booking_node(state: OrchestratorState):
-    import time
-    latest_user_input = state["messages"][-1].content
-    response = await booking_module.executor.ainvoke({"input": latest_user_input})
-    
-    # Update agent flow to mark as completed
-    agent_flow = state.get("agent_flow", [])
-    for entry in reversed(agent_flow):
-        if entry["agent"] == "Booking" and entry["status"] in ["pending", "active"]:
-            entry["status"] = "completed"
-            entry["end_time"] = time.time()
-            break
-    
-    return {
-        "messages": [HumanMessage(content=f"[Booking Agent Response]: {response['output']}")],
-        "agent_flow": agent_flow,
-    }
+async def booking_node(state: OrchestratorState, writer=None):
+    _tok = _UI_WRITER.set(writer) if writer is not None else None
+    try:
+        agent_flow = _mark_flow_active(state, "Booking")
+        _stream_event({
+            "type": "agent_start",
+            "agent": "Booking",
+            "text": "Connected with the booking agent. Searching accommodations…",
+        })
+        latest_user_input = state["messages"][-1].content
+        _stream_event({
+            "type": "thought",
+            "agent": "Booking",
+            "text": "Opening Booking.com tools and gathering stay options.",
+        })
+        try:
+            response = await booking_module.executor.ainvoke({"input": latest_user_input})
+            _stream_event({"type": "thought", "agent": "Booking", "text": "Hotel booking options generated."})
+            return {
+                "messages": [HumanMessage(content=f"[Booking Agent Response]: {response['output']}")],
+                "agent_flow": _mark_flow_complete({"agent_flow": agent_flow}, "Booking"),
+            }
+        finally:
+            _stream_event({"type": "agent_end", "agent": "Booking"})
+    finally:
+        if _tok is not None:
+            _UI_WRITER.reset(_tok)
 
 
-def transport_node(state: OrchestratorState):
-    import time
-    latest_user_input = state["messages"][-1].content
-    response = transport_module.executor.invoke({"input": latest_user_input})
-    
-    # Update agent flow to mark as completed
-    agent_flow = state.get("agent_flow", [])
-    for entry in reversed(agent_flow):
-        if entry["agent"] == "Transport" and entry["status"] in ["pending", "active"]:
-            entry["status"] = "completed"
-            entry["end_time"] = time.time()
-            break
-    
-    return {
-        "messages": [HumanMessage(content=f"[Transport Agent Response]: {response['output']}")],
-        "agent_flow": agent_flow,
-    }
+def transport_node(state: OrchestratorState, writer=None):
+    _tok = _UI_WRITER.set(writer) if writer is not None else None
+    try:
+        agent_flow = _mark_flow_active(state, "Transport")
+        _stream_event({
+            "type": "agent_start",
+            "agent": "Transport",
+            "text": "Connected with the transport agent to check IRCTC availability…",
+        })
+        latest_user_input = state["messages"][-1].content
+        _stream_event({
+            "type": "thought",
+            "agent": "Transport",
+            "text": "Querying train search tools for seats and schedules.",
+        })
+        try:
+            response = transport_module.executor.invoke({"input": latest_user_input})
+            _stream_event({"type": "thought", "agent": "Transport", "text": "Transport availability report generated."})
+            return {
+                "messages": [HumanMessage(content=f"[Transport Agent Response]: {response['output']}")],
+                "agent_flow": _mark_flow_complete({"agent_flow": agent_flow}, "Transport"),
+            }
+        finally:
+            _stream_event({"type": "agent_end", "agent": "Transport"})
+    finally:
+        if _tok is not None:
+            _UI_WRITER.reset(_tok)
 
 # ---------------------------------------------------------------------------
 # 5. Supervisor Router Node Logic
@@ -195,72 +279,124 @@ def _is_travel_query(text: str) -> bool:
     return any(kw in lower for kw in _TRAVEL_KEYWORDS)
 
 
-def supervisor_node(state: OrchestratorState):
-    import time
-    
-    last_user_msg = next(
-        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-        ""
-    )
-    
-    # Initialize or increment step counter
-    current_step = state.get("current_step", 0) + 1
-    step_timestamps = state.get("step_timestamps", {})
-    step_timestamps[current_step] = time.time()
-    
-    agent_flow = state.get("agent_flow", [])
+def supervisor_node(state: OrchestratorState, writer=None):
+    _tok = _UI_WRITER.set(writer) if writer is not None else None
+    try:
+        last_user_msg = next(
+            (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+            ""
+        )
 
-    # Fast-path for non-travel queries: generate dynamic LLM response without hardcoded strings
-    if not _is_travel_query(last_user_msg):
-        messages = [
-            SystemMessage(content="You are the Master Travel Orchestrator. Respond warmly and helpfully to general questions or greetings, explaining how your team (Weather, Tour Guide, Booking, Transport) can help plan trips when ready.")
-        ] + state["messages"]
-        reply_msg = ORCHESTRATOR_LLM.invoke(messages)
-        reasoning = "Non-travel query detected. Providing direct conversational response."
-        return {
-            "next": "FINISH",
-            "direct_reply": reply_msg.content,
-            "reasoning": reasoning,
-            "current_step": current_step,
-            "step_timestamps": step_timestamps,
-        }
+        current_step = state.get("current_step", 0) + 1
+        step_timestamps = dict(state.get("step_timestamps") or {})
+        step_timestamps[current_step] = time.time()
+        agent_flow = list(state.get("agent_flow") or [])
 
-    # Travel query → ask LLM to route to the right sub-agent
-    messages = [SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT)] + state["messages"]
-    structured_llm = ORCHESTRATOR_LLM.with_structured_output(RouteResponse)
-    response = structured_llm.invoke(messages)
-    
-    # Generate fallback reasoning if LLM didn't provide one
-    reasoning = response.reasoning if response.reasoning else f"Routing to {response.next} agent to handle the request."
-    
-    # Add to agent flow if routing to a sub-agent
-    if response.next != "FINISH":
-        agent_flow.append({
+        _stream_event({
+            "type": "agent_start",
+            "agent": "Supervisor",
+            "text": "Orchestrator is analyzing the request and choosing the next specialist…",
             "step": current_step,
-            "agent": response.next,
-            "status": "pending",
-            "reasoning": reasoning,
-            "start_time": time.time(),
         })
-    
-    return {
-        "next": response.next,
-        "direct_reply": response.direct_reply or None,
-        "reasoning": reasoning,
-        "current_step": current_step,
-        "step_timestamps": step_timestamps,
-        "agent_flow": agent_flow,
-    }
+
+        try:
+            if not _is_travel_query(last_user_msg):
+                _stream_event({
+                    "type": "thought",
+                    "agent": "Supervisor",
+                    "text": "This does not look like a travel-planning task. Drafting a direct reply.",
+                    "step": current_step,
+                })
+                messages = [
+                    SystemMessage(content="You are the Master Travel Orchestrator. Respond warmly and helpfully to general questions or greetings, explaining how your team (Weather, Tour Guide, Booking, Transport) can help plan trips when ready.")
+                ] + state["messages"]
+                reply_msg = ORCHESTRATOR_LLM.invoke(messages)
+                reasoning = "Non-travel query detected. Providing direct conversational response."
+                _stream_event({
+                    "type": "thought",
+                    "agent": "Supervisor",
+                    "text": reasoning,
+                    "next": "FINISH",
+                    "step": current_step,
+                })
+                return {
+                    "next": "FINISH",
+                    "direct_reply": reply_msg.content,
+                    "reasoning": reasoning,
+                    "current_step": current_step,
+                    "step_timestamps": step_timestamps,
+                }
+
+            _stream_event({
+                "type": "thought",
+                "agent": "Supervisor",
+                "text": "Travel intent detected. Routing to the best specialist agent.",
+                "step": current_step,
+            })
+            messages = [SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT)] + state["messages"]
+            structured_llm = ORCHESTRATOR_LLM.with_structured_output(RouteResponse)
+            response = structured_llm.invoke(messages)
+
+            reasoning = response.reasoning if response.reasoning else f"Routing to {response.next} agent to handle the request."
+
+            if response.next != "FINISH":
+                agent_flow.append({
+                    "step": current_step,
+                    "agent": response.next,
+                    "status": "pending",
+                    "reasoning": reasoning,
+                    "start_time": None,
+                })
+                _stream_event({
+                    "type": "thought",
+                    "agent": "Supervisor",
+                    "text": reasoning,
+                    "next": response.next,
+                    "step": current_step,
+                })
+            else:
+                _stream_event({
+                    "type": "thought",
+                    "agent": "Supervisor",
+                    "text": reasoning or "All requested work looks complete. Wrapping up.",
+                    "next": "FINISH",
+                    "step": current_step,
+                })
+
+            return {
+                "next": response.next,
+                "direct_reply": response.direct_reply or None,
+                "reasoning": reasoning,
+                "current_step": current_step,
+                "step_timestamps": step_timestamps,
+                "agent_flow": agent_flow,
+            }
+        finally:
+            _stream_event({"type": "agent_end", "agent": "Supervisor", "step": current_step})
+    finally:
+        if _tok is not None:
+            _UI_WRITER.reset(_tok)
 
 # ---------------------------------------------------------------------------
 # 6. Build and Compile the StateGraph
 # ---------------------------------------------------------------------------
-def finish_node(state: OrchestratorState):
+def finish_node(state: OrchestratorState, writer=None):
     """Surfaces a direct_reply (e.g. greeting response) as an AI message."""
-    reply = state.get("direct_reply")
-    if reply:
-        return {"messages": [AIMessage(content=reply)]}
-    return {}
+    _tok = _UI_WRITER.set(writer) if writer is not None else None
+    try:
+        reply = state.get("direct_reply")
+        _stream_event({
+            "type": "thought",
+            "agent": "Supervisor",
+            "text": "Orchestration finished. Compiling the final response.",
+            "next": "FINISH",
+        })
+        if reply:
+            return {"messages": [AIMessage(content=reply)]}
+        return {}
+    finally:
+        if _tok is not None:
+            _UI_WRITER.reset(_tok)
 
 
 def build_orchestrator_graph():
