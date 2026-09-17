@@ -62,7 +62,7 @@ else:
 # Set orchestrator LLM dynamically based on available API key
 if os.getenv("GROQ_API_KEY"):
     from langchain_groq import ChatGroq
-    ORCHESTRATOR_LLM = ChatGroq(model="openai/gpt-oss-120b", temperature=0, groq_api_key=os.getenv("GROQ_API_KEY"))
+    ORCHESTRATOR_LLM = ChatGroq(model="openai/gpt-oss-120b", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 elif os.getenv("OPENAI_API_KEY"):
     from langchain_openai import ChatOpenAI
     ORCHESTRATOR_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0)
