@@ -42,6 +42,10 @@ class OrchestratorState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     next: str
     direct_reply: Optional[str]
+    reasoning: Optional[str]
+    current_step: int
+    step_timestamps: dict
+    agent_flow: list
 
 # ---------------------------------------------------------------------------
 # 3. Initialize Instantiated Sub-Agents
@@ -69,33 +73,86 @@ print("Agents was initiated...")
 # 4. Node Definitions Wrapping Sub-Agents
 # ---------------------------------------------------------------------------
 def weather_node(state: OrchestratorState):
+    import time
     latest_user_input = state["messages"][-1].content
     response = weather_executor.invoke({"input": latest_user_input})
-    return {"messages": [HumanMessage(content=f"[Weather Agent Response]: {response['output']}")]}
+    
+    # Update agent flow to mark as completed
+    agent_flow = state.get("agent_flow", [])
+    for entry in reversed(agent_flow):
+        if entry["agent"] == "Weather" and entry["status"] in ["pending", "active"]:
+            entry["status"] = "completed"
+            entry["end_time"] = time.time()
+            break
+    
+    return {
+        "messages": [HumanMessage(content=f"[Weather Agent Response]: {response['output']}")],
+        "agent_flow": agent_flow,
+    }
 
 
 def tour_guide_node(state: OrchestratorState):
+    import time
     response = tour_guide_agent.invoke(state)
-    return {"messages": [response["messages"][-1]]}
+    
+    # Update agent flow to mark as completed
+    agent_flow = state.get("agent_flow", [])
+    for entry in reversed(agent_flow):
+        if entry["agent"] == "TourGuide" and entry["status"] in ["pending", "active"]:
+            entry["status"] = "completed"
+            entry["end_time"] = time.time()
+            break
+    
+    return {
+        "messages": [response["messages"][-1]],
+        "agent_flow": agent_flow,
+    }
 
 
 async def booking_node(state: OrchestratorState):
+    import time
     latest_user_input = state["messages"][-1].content
     response = await booking_module.executor.ainvoke({"input": latest_user_input})
-    return {"messages": [HumanMessage(content=f"[Booking Agent Response]: {response['output']}")]}
+    
+    # Update agent flow to mark as completed
+    agent_flow = state.get("agent_flow", [])
+    for entry in reversed(agent_flow):
+        if entry["agent"] == "Booking" and entry["status"] in ["pending", "active"]:
+            entry["status"] = "completed"
+            entry["end_time"] = time.time()
+            break
+    
+    return {
+        "messages": [HumanMessage(content=f"[Booking Agent Response]: {response['output']}")],
+        "agent_flow": agent_flow,
+    }
 
 
 def transport_node(state: OrchestratorState):
+    import time
     latest_user_input = state["messages"][-1].content
     response = transport_module.executor.invoke({"input": latest_user_input})
-    return {"messages": [HumanMessage(content=f"[Transport Agent Response]: {response['output']}")]}
+    
+    # Update agent flow to mark as completed
+    agent_flow = state.get("agent_flow", [])
+    for entry in reversed(agent_flow):
+        if entry["agent"] == "Transport" and entry["status"] in ["pending", "active"]:
+            entry["status"] = "completed"
+            entry["end_time"] = time.time()
+            break
+    
+    return {
+        "messages": [HumanMessage(content=f"[Transport Agent Response]: {response['output']}")],
+        "agent_flow": agent_flow,
+    }
 
 # ---------------------------------------------------------------------------
 # 5. Supervisor Router Node Logic
 # ---------------------------------------------------------------------------
 class RouteResponse(BaseModel):
     next: Literal["Weather", "TourGuide", "Booking", "Transport", "FINISH"]
-    direct_reply: Optional[str] = None  # filled when next==FINISH for non-travel queries
+    direct_reply: Optional[str] = None
+    reasoning: str = ""  # Explanation of routing decision
 
 SUPERVISOR_SYSTEM_PROMPT = """
 You are the Master Travel Orchestrator — an AI assistant managing a team of specialized travel sub-agents.
@@ -114,6 +171,13 @@ Rules:
 1. For greetings or non-travel questions, set next=FINISH and write a helpful reply in direct_reply.
 2. For travel queries, route to the appropriate agent and leave direct_reply empty.
 3. Once all parts of a travel request are fulfilled, set next=FINISH.
+
+IMPORTANT: When making routing decisions, you MUST provide clear reasoning explaining:
+- What aspects of the user's request triggered this routing choice
+- Which specific keywords or intents were identified
+- Why this agent is the appropriate choice
+
+Your reasoning should be concise (1-2 sentences) and specific to this request.
 """
 
 # Keywords that signal a travel-planning intent
@@ -132,10 +196,19 @@ def _is_travel_query(text: str) -> bool:
 
 
 def supervisor_node(state: OrchestratorState):
+    import time
+    
     last_user_msg = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
         ""
     )
+    
+    # Initialize or increment step counter
+    current_step = state.get("current_step", 0) + 1
+    step_timestamps = state.get("step_timestamps", {})
+    step_timestamps[current_step] = time.time()
+    
+    agent_flow = state.get("agent_flow", [])
 
     # Fast-path for non-travel queries: generate dynamic LLM response without hardcoded strings
     if not _is_travel_query(last_user_msg):
@@ -143,13 +216,41 @@ def supervisor_node(state: OrchestratorState):
             SystemMessage(content="You are the Master Travel Orchestrator. Respond warmly and helpfully to general questions or greetings, explaining how your team (Weather, Tour Guide, Booking, Transport) can help plan trips when ready.")
         ] + state["messages"]
         reply_msg = ORCHESTRATOR_LLM.invoke(messages)
-        return {"next": "FINISH", "direct_reply": reply_msg.content}
+        reasoning = "Non-travel query detected. Providing direct conversational response."
+        return {
+            "next": "FINISH",
+            "direct_reply": reply_msg.content,
+            "reasoning": reasoning,
+            "current_step": current_step,
+            "step_timestamps": step_timestamps,
+        }
 
     # Travel query → ask LLM to route to the right sub-agent
     messages = [SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT)] + state["messages"]
     structured_llm = ORCHESTRATOR_LLM.with_structured_output(RouteResponse)
     response = structured_llm.invoke(messages)
-    return {"next": response.next, "direct_reply": response.direct_reply or None}
+    
+    # Generate fallback reasoning if LLM didn't provide one
+    reasoning = response.reasoning if response.reasoning else f"Routing to {response.next} agent to handle the request."
+    
+    # Add to agent flow if routing to a sub-agent
+    if response.next != "FINISH":
+        agent_flow.append({
+            "step": current_step,
+            "agent": response.next,
+            "status": "pending",
+            "reasoning": reasoning,
+            "start_time": time.time(),
+        })
+    
+    return {
+        "next": response.next,
+        "direct_reply": response.direct_reply or None,
+        "reasoning": reasoning,
+        "current_step": current_step,
+        "step_timestamps": step_timestamps,
+        "agent_flow": agent_flow,
+    }
 
 # ---------------------------------------------------------------------------
 # 6. Build and Compile the StateGraph

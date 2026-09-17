@@ -41,7 +41,7 @@ def run_async_coro(coro):
         return ex.submit(_worker).result()
 
 # ── Cached Agent Imports ──────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, ttl=60)  # Cache for 60 seconds to allow updates
 def load_agent_suite():
     """Cache heavy agent imports and LLM workflow graphs in memory to eliminate rerun latency."""
     try:
@@ -280,6 +280,11 @@ with st.sidebar:
         ]
         st.session_state.trip_info = {k: None for k in st.session_state.trip_info}
         st.rerun()
+    
+    if st.button("🔄 Clear Cache", use_container_width=True, help="Clear agent cache to reload updates"):
+        st.cache_resource.clear()
+        st.success("Cache cleared! Reloading...")
+        st.rerun()
 
 # ── Hero header ───────────────────────────────────────────────────────────────
 page = st.session_state.active_page
@@ -402,40 +407,130 @@ if page == "chat":
             }
 
             with st.chat_message("assistant", avatar="🤖"):
-                status = st.status("🤖 Orchestrating agents…", expanded=True)
+                status_container = st.status("🤖 Orchestrating agents…", expanded=True)
+                
+                # Agent icons mapping
+                agent_icons = {
+                    "Weather": "🌦️",
+                    "TourGuide": "🗺️",
+                    "Booking": "🏨",
+                    "Transport": "🚆",
+                    "FINISH": "✅"
+                }
+                
+                import time
+                start_time = time.time()
+                displayed_steps = set()
+                responses = []
 
-                async def _run(user_msgs: list) -> dict:
-                    """Runs entirely in a worker thread – NO st.* calls allowed here."""
+                async def _run_and_collect():
+                    """Collect all updates from the graph stream."""
                     graph = build_orchestrator_graph()
-                    hm = [HumanMessage(content=c) for c in user_msgs]
-                    status_logs, responses = [], []
+                    hm = [HumanMessage(content=c) for c in msgs_snapshot]
+                    
+                    updates_list = []
+                    agent_flow = []
+                    
+                    print(f"\n[DEBUG] Starting graph execution")
+                    
                     async for chunk in graph.astream({"messages": hm}):
                         for node, update in chunk.items():
+                            print(f"[DEBUG] Node: {node}, Keys: {list(update.keys())}")
+                            
+                            # Collect Supervisor reasoning
                             if node == "Supervisor":
-                                next_node = update.get("next")
-                                if next_node in AGENT_CONNECT_LOGS:
-                                    status_logs.append(AGENT_CONNECT_LOGS[next_node])
-                            elif node in AGENT_COMPLETE_LOGS and "messages" in update:
-                                status_logs.append(AGENT_COMPLETE_LOGS[node])
-                                responses.append({
-                                    "agent": node,
-                                    "content": update["messages"][-1].content,
+                                if "reasoning" in update:
+                                    step = update.get("current_step", 0)
+                                    next_agent = update.get("next")
+                                    reasoning = update["reasoning"]
+                                    
+                                    if step not in displayed_steps:
+                                        elapsed = time.time() - start_time
+                                        icon = agent_icons.get(next_agent, "🤖")
+                                        
+                                        updates_list.append({
+                                            "type": "reasoning",
+                                            "step": step,
+                                            "agent": next_agent,
+                                            "reasoning": reasoning,
+                                            "elapsed": elapsed,
+                                            "icon": icon
+                                        })
+                                        displayed_steps.add(step)
+                                        print(f"[DEBUG] ✓ Reasoning collected: {reasoning[:50]}...")
+                                    
+                                if "agent_flow" in update:
+                                    agent_flow = update["agent_flow"]
+                            
+                            # Collect agent execution status
+                            elif node in ["Weather", "TourGuide", "Booking", "Transport"]:
+                                # Agent started
+                                updates_list.append({
+                                    "type": "agent_start",
+                                    "agent": node
                                 })
-                    return {"status_logs": status_logs, "responses": responses}
+                                print(f"[DEBUG] ✓ {node} started")
+                                
+                                # Agent completed
+                                if "messages" in update:
+                                    updates_list.append({
+                                        "type": "agent_complete",
+                                        "agent": node
+                                    })
+                                    
+                                    responses.append({
+                                        "agent": node,
+                                        "content": update["messages"][-1].content,
+                                    })
+                                    print(f"[DEBUG] ✓ {node} completed")
+                    
+                    return updates_list, agent_flow
 
                 try:
-                    result = run_async_coro(_run(msgs_snapshot))
+                    # Collect all updates
+                    updates_list, agent_flow = run_async_coro(_run_and_collect())
+                    
+                    # Now render all updates on the main thread (with Streamlit context)
+                    for update_item in updates_list:
+                        if update_item["type"] == "reasoning":
+                            status_container.write(
+                                f"**Step {update_item['step']}** ({update_item['elapsed']:.1f}s) → "
+                                f"{update_item['icon']} **{update_item['agent']}**  \n"
+                                f"_{update_item['reasoning']}_"
+                            )
+                        elif update_item["type"] == "agent_start":
+                            badge_html = f'''
+                            <div class="agent-loading-badge">
+                                <div class="spinner-ring"></div>
+                                <span>{update_item['agent']} agent is working...</span>
+                            </div>
+                            '''
+                            status_container.markdown(badge_html, unsafe_allow_html=True)
+                        elif update_item["type"] == "agent_complete":
+                            badge_html = f'''
+                            <div class="agent-done-badge">
+                                <span>✓</span>
+                                <span>{update_item['agent']} agent completed</span>
+                            </div>
+                            '''
+                            status_container.markdown(badge_html, unsafe_allow_html=True)
+                    
+                    # Display timeline summary
+                    if agent_flow:
+                        total_time = time.time() - start_time
+                        status_container.write(f"\n**Total orchestration time:** {total_time:.2f}s")
+                        
+                        status_container.write("**Agent execution times:**")
+                        for entry in agent_flow:
+                            duration = entry.get("end_time", time.time()) - entry["start_time"]
+                            status_container.write(f"  - {entry['agent']}: {duration:.2f}s")
+                    
+                    status_container.update(label="🎉 Orchestration Complete!", state="complete", expanded=False)
 
-                    # Render connection and completion status logs on main thread
-                    for log in result["status_logs"]:
-                        status.write(log)
-
-                    status.update(label="🎉 Orchestration Complete!", state="complete", expanded=False)
-
-                    if result["responses"]:
+                    if responses:
                         parts = [
                             f"**[{r['agent']}]**\n\n{r['content']}"
-                            for r in result["responses"]
+                            for r in responses
                         ]
                         reply = "\n\n---\n\n".join(parts)
                     else:
@@ -450,8 +545,12 @@ if page == "chat":
                     )
 
                 except Exception as exc:
-                    status.update(label="❌ Error", state="error")
+                    # Show error in the status container
+                    status_container.update(label="❌ Error", state="error")
                     st.error(f"⚠️ {friendly_error(exc)}")
+                    import traceback
+                    print(f"[ERROR] Orchestration failed:")
+                    traceback.print_exc()
 
 
 # ════════════════════════════════════════════════════════════════════════════
